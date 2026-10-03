@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fitze-x402-seller": {
+      "url": "https://fitze-x402-seller.app.workbuddy.host/mcp",
+      "transport": "streamable-http",
+      "description": "Pay-per-call research/data tools, settled in USDC on Base via x402. free_url_check is free; paid tools answer HTTP 402 with x402 payment requirements ($0.005-$0.25/call)."
+    }
+  }
+}
