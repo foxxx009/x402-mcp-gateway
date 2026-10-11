@@ -40,6 +40,51 @@ const MPP_REALM = 'fitze-x402-seller.app.workbuddy.host';
 // 别改回 x402.org。
 const PUBLIC_FACILITATOR = 'https://facilitator.payai.network';
 
+// --- Gateway / marketplace channel secret (2026-10-12) ---
+// Gateway-style marketplaces (claw402.ai, x402layer.cc, RapidAPI-style) collect the
+// payment THEMSELVES, so they need an upstream that does not charge again. That
+// means my x402 endpoint cannot be their upstream as-is; this channel lets a
+// trusted gateway call the same tools without the x402 handshake.
+//
+// The secret is read from an ENV VAR if present, otherwise from a file deployed
+// next to server.js (./marketplace-secret.txt, first non-empty line). A file works
+// on deploy targets that cannot inject environment variables. If neither exists
+// the channel stays CLOSED. NEVER hardcode the literal here.
+let _gatewaySecretCache = null;
+function gatewaySecret() {
+  if (_gatewaySecretCache !== null) return _gatewaySecretCache || null;
+  const fromEnv = process.env.MARKETPLACE_PROXY_SECRET;
+  if (fromEnv && String(fromEnv).trim()) {
+    _gatewaySecretCache = String(fromEnv).trim();
+    return _gatewaySecretCache;
+  }
+  try {
+    const raw = fs.readFileSync(new URL('./marketplace-secret.txt', import.meta.url), 'utf8');
+    const line = raw.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (line) {
+      _gatewaySecretCache = line;
+      return line;
+    }
+  } catch {
+    /* no secret file -> channel closed */
+  }
+  _gatewaySecretCache = '';
+  return null;
+}
+
+// Abuse bound for the gateway channel: a leaked secret must not turn into free
+// unlimited use. Cap relay calls per rolling 24h; past the cap the request falls
+// through to the normal x402 handshake (real paying buyers are never blocked).
+const GATEWAY_DAILY_CAP = Number(process.env.GATEWAY_DAILY_CAP || 2000);
+let _gatewayUses = [];
+function gatewayAllow() {
+  const now = Date.now();
+  _gatewayUses = _gatewayUses.filter((t) => now - t < 86400000);
+  if (_gatewayUses.length >= GATEWAY_DAILY_CAP) return false;
+  _gatewayUses.push(now);
+  return true;
+}
+
 function b64url(o) {
   return Buffer.from(JSON.stringify(o)).toString('base64url');
 }
@@ -154,7 +199,12 @@ function facilitatorBody(version, auth, reqs, resource) {
     x402Version: 2,
     paymentPayload: {
       x402Version: 2,
-      resource,
+      // v2 facilitators require the resource as an OBJECT ({url,...}), not a
+      // bare string — payai rejects a string resource with invalid_payload.
+      resource:
+        typeof resource === 'string'
+          ? { url: resource, description: 'Paid tool', mimeType: 'application/json' }
+          : resource,
       accepted: reqs,
       payload: { signature: auth.signature, authorization },
     },
@@ -172,8 +222,8 @@ async function settleEip3009(auth, toolKey, resource) {
   ];
   let lastReason = 'facilitator_unreachable';
   for (const [version, reqs] of attempts) {
-    const body = facilitatorBody(version, auth, reqs, resource);
     try {
+      const body = facilitatorBody(version, auth, reqs, resource);
       const vr = await (
         await fetch(PUBLIC_FACILITATOR + '/verify', {
           method: 'POST',
@@ -386,6 +436,17 @@ function normalizeArgs(toolKey, body) {
   if (!primary) return body;
   if (body[primary] === undefined && body.q !== undefined) body[primary] = body.q;
   delete body.q;
+  // 2026-10-04: a *paid* call must never come back 400. Paid-verification censuses
+  // (PayAPI's own settlement check, nohumans.directory, scvd.store) call the bare route
+  // with no arguments at all; tools with required args used to answer 400 after the money
+  // moved, which reads as "took the money, answered nothing". Fill missing keys from the
+  // advertised Bazaar example input so a zero-argument paid call still returns product.
+  const example = TOOL_INPUT_EXAMPLES[toolKey];
+  if (example && typeof example === 'object') {
+    for (const k of Object.keys(example)) {
+      if (body[k] === undefined || body[k] === null || body[k] === '') body[k] = example[k];
+    }
+  }
   return body;
 }
 
@@ -686,27 +747,78 @@ function decodeXPayment(header) {
 // Walk a decoded payment payload looking for an EIP-3009 transferWithAuthorization
 // (from/to/value/validAfter/validBefore/nonce + signature) anywhere inside it.
 // v2 x402 payloads carry it under payload.authorization; MPP-wrapped ones at the top.
+// Normalize a signature that may arrive as a 65-byte hex string OR an {r,s,v}
+// object (official x402 v2 SDKs emit the object form) into a 65-byte hex string.
+function normalizeSig(sig) {
+  if (typeof sig === 'string') return sig;
+  if (sig && typeof sig === 'object' && sig.r && sig.s) {
+    const r = String(sig.r).replace(/^0x/, '').padStart(64, '0');
+    const s = String(sig.s).replace(/^0x/, '').padStart(64, '0');
+    let v;
+    if (sig.v !== undefined) v = typeof sig.v === 'number' ? sig.v : parseInt(String(sig.v), 10);
+    else if (sig.yParity !== undefined)
+      v = (typeof sig.yParity === 'number' ? sig.yParity : parseInt(String(sig.yParity), 10)) + 27;
+    else v = 27;
+    if (!Number.isFinite(v)) v = 27;
+    if (v < 27) v += 27; // yParity 0/1 → recovery id 27/28
+    return '0x' + r + s + v.toString(16).padStart(2, '0');
+  }
+  return null;
+}
+
 function findEip3009Auth(obj) {
   let found = null;
   (function walk(o) {
     if (found || !o || typeof o !== 'object') return;
+    // Shape A (flat): {from,to,value,nonce,signature} — signature lives inside
+    // the authorization object itself (MPP-style envelopes).
     if (
       typeof o.from === 'string' &&
       typeof o.to === 'string' &&
       o.value !== undefined &&
       o.nonce !== undefined &&
-      typeof o.signature === 'string'
+      o.signature !== undefined
     ) {
-      found = {
-        from: o.from,
-        to: o.to,
-        value: String(o.value),
-        validAfter: String(o.validAfter ?? 0),
-        validBefore: String(o.validBefore ?? 0),
-        nonce: o.nonce,
-        signature: o.signature,
-      };
-      return;
+      const sig = normalizeSig(o.signature);
+      if (sig) {
+        found = {
+          from: o.from,
+          to: o.to,
+          value: String(o.value),
+          validAfter: String(o.validAfter ?? 0),
+          validBefore: String(o.validBefore ?? 0),
+          nonce: o.nonce,
+          signature: sig,
+        };
+        return;
+      }
+    }
+    // Shape B (standard x402 v1/v2 SDK): {signature, authorization} SIBLINGS —
+    // payload.signature (hex string or {r,s,v}) beside payload.authorization
+    // {from,to,value,validAfter,validBefore,nonce}. This is what every official
+    // x402 client emits; before 2026-10-11 it was missed here, so valid signed
+    // payments fell through to the tx-hash path and bounced with a fresh 402.
+    if (o.authorization && typeof o.authorization === 'object' && o.signature !== undefined) {
+      const a = o.authorization;
+      const sig = normalizeSig(o.signature);
+      if (
+        sig &&
+        typeof a.from === 'string' &&
+        typeof a.to === 'string' &&
+        a.value !== undefined &&
+        a.nonce !== undefined
+      ) {
+        found = {
+          from: a.from,
+          to: a.to,
+          value: String(a.value),
+          validAfter: String(a.validAfter ?? 0),
+          validBefore: String(a.validBefore ?? 0),
+          nonce: a.nonce,
+          signature: sig,
+        };
+        return;
+      }
     }
     for (const k of Object.keys(o)) walk(o[k]);
   })(obj);
@@ -781,6 +893,22 @@ function manifest() {
     role: ['seller'],
     version: 'sha256:' + Date.now().toString(36),
     updatedAt: new Date().toISOString(),
+    // x402 discovery spec: `resources` is the canonical list of payable doors on
+    // this host. Without it a spec-conformant crawler (scvd.store census, Coinbase
+    // Bazaar) reports the file as carrying no doors at all. `tools` below stays as
+    // the richer, human-readable companion.
+    resources: Object.entries(tools).map(([name, t]) => ({
+      resource: PUBLIC_BASE + '/tools/' + name,
+      type: 'http',
+      name,
+      description: t.description,
+      priceUsd: t.priceUsd,
+      payTo: RECIPIENT,
+      network: 'eip155:8453',
+      asset: USDC,
+      scheme: 'exact',
+      method: 'GET,POST',
+    })),
     paymentTerms: {
       scheme: 'exact',
       network: 'eip155:8453',
@@ -935,7 +1063,7 @@ const server = http.createServer(async (req, res) => {
           description:
             'Pay-per-call research/data tools settled in USDC on Base via x402. ' +
             'free_url_check is free; all other tools answer HTTP 402 with x402 ' +
-            'payment requirements ($0.005–$0.25 per call).',
+            'payment requirements ($0.002–$0.03 per call).',
         },
       },
     };
@@ -1016,7 +1144,7 @@ const server = http.createServer(async (req, res) => {
         description: 'Pay-per-call AI/data tools settled in USDC on Base via x402. No account, no API key — pay the 402 and receive the result. All endpoints also accept a bare hostname without the https:// prefix.',
         contact: { email: 'tbsa7590@agent.qq.com', name: 'fitze' },
         'x-guidance':
-          'Seven deterministic research tools. Start with free_url_check (free). Paid tools cost $0.01-$3 per call, settled in USDC on Base via x402 v1 exact. ' +
+          'Thirteen deterministic research/data tools. Start with free_url_check (free). Paid tools cost $0.002-$0.03 per call, settled in USDC on Base via x402 (v1 + v2 exact). ' +
           'Every endpoint accepts GET query params AND a POST JSON body with the same keys. URL-typed inputs accept bare hostnames (example.com) — the https:// prefix is added automatically.',
       },
       servers: [{ url: PUBLIC_BASE }],
@@ -1213,6 +1341,135 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // MCP over SSE. Older/other agent clients (and some directories such as
+  // payapi.market) expect the legacy `text/event-stream` transport at /mcp/sse
+  // rather than POST-only streamable-http at /mcp. We do not duplicate the
+  // 402 logic here: each JSON-RPC message is translated into an internal
+  // dispatch to the same /tools/<name> handler used by the HTTP routes, so
+  // payment, verification and the price table stay in exactly one place.
+  if (url.pathname === '/mcp/sse' || url.pathname === '/messages') {
+    const isPost = req.method === 'POST' && url.pathname === '/messages';
+    if (url.pathname === '/mcp/sse' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      // Endpoint event: tells the client where to POST JSON-RPC messages.
+      res.write('event: endpoint\ndata: ' + PUBLIC_BASE + '/messages\n\n');
+      const ka = setInterval(() => {
+        try { res.write(': keepalive\n\n'); } catch { /* closed */ }
+      }, 15000);
+      req.on('close', () => clearInterval(ka));
+      return;
+    }
+
+    if (!isPost) {
+      res.writeHead(405, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'GET /mcp/sse opens the stream; POST JSON-RPC to /messages' }));
+    }
+
+    let rpc = null;
+    try {
+      rpc = JSON.parse(await readBody(req));
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+    }
+    if (rpc.id === undefined || rpc.id === null) {
+      res.writeHead(202);
+      return res.end();
+    }
+
+    const reply = (result, err) => {
+      const body = { jsonrpc: '2.0', id: rpc.id };
+      if (err) body.error = err;
+      else body.result = result;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+
+    try {
+      if (rpc.method === 'initialize') {
+        return reply({
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'fitze-x402-seller', version: '1.0.0' },
+        });
+      }
+      if (rpc.method === 'ping') return reply({});
+      if (rpc.method === 'tools/list') {
+        return reply({
+          tools: Object.entries(tools).map(([name, t]) => ({
+            name,
+            title: name,
+            description: t.priceUsd === 0 ? 'FREE — ' + t.description : `$${t.priceUsd} per call — ` + t.description,
+            inputSchema:
+              t.inputSchema ||
+              (TOOL_SCHEMAS[name] && TOOL_SCHEMAS[name].input) ||
+              { type: 'object', properties: { q: { type: 'string', description: 'JSON or key=value input for the tool' } } },
+            _meta: t.priceUsd === 0 ? {} : { 'x402/priceUsd': t.priceUsd, 'x402/network': 'base', 'x402/asset': 'USDC' },
+          })),
+        });
+      }
+      if (rpc.method === 'tools/call') {
+        const p = rpc.params || {};
+        const name = p.name;
+        const tool = tools[name];
+        if (!tool) return reply(undefined, { code: -32602, message: 'Unknown tool: ' + name });
+        const args = p.arguments || {};
+        const meta = p._meta || {};
+        // On this transport the proof can only ride inside the JSON-RPC body
+        // (no per-message headers), so check every documented slot.
+        const proof =
+          meta._x_payment ||
+          meta['x402/payment'] ||
+          args._x_payment ||
+          args.x402_payment ||
+          p._x_payment ||
+          null;
+        const resource = PUBLIC_BASE + '/tools/' + name;
+        const amount = Math.round(tool.priceUsd * 1e6);
+        if (tool.priceUsd > 0) {
+          if (!proof) {
+            const ch = paymentRequirements(name, resource);
+            res.writeHead(402, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ ...ch, x402Version: 2, error: 'Payment Required', resource: { url: resource, description: tool.description } }));
+          }
+          const parsed = decodeXPayment(proof);
+          if (!parsed) {
+            const ch = paymentRequirements(name, resource);
+            res.writeHead(402, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ ...ch, x402Version: 2, error: 'Payment Required', xPaymentError: 'bad_x_payment_header' }));
+          }
+          const v = await verifyXPayment(parsed, amount);
+          if (!v.ok) {
+            const ch = paymentRequirements(name, resource);
+            res.writeHead(402, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ ...ch, x402Version: 2, error: 'Payment Required', xPaymentError: v.reason || 'invalid_payment' }));
+          }
+          try {
+            const result = await tool.run(normalizeArgs(name, args));
+            return reply({ content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result });
+          } catch (e) {
+            return reply({ content: [{ type: 'text', text: 'Error: ' + String(e.message || e) }], isError: true });
+          }
+        }
+        // Free tool: no payment needed.
+        try {
+          const result = await tool.run(normalizeArgs(name, args));
+          return reply({ content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result });
+        } catch (e) {
+          return reply({ content: [{ type: 'text', text: 'Error: ' + String(e.message || e) }], isError: true });
+        }
+      }
+      return reply(undefined, { code: -32601, message: 'Method not found: ' + rpc.method });
+    } catch (e) {
+      return reply(undefined, { code: -32603, message: String(e.message || e) });
+    }
+  }
+
   if (url.pathname.startsWith('/tools/')) {
     const toolKey = url.pathname.slice('/tools/'.length);
     const tool = tools[toolKey];
@@ -1252,19 +1509,19 @@ const server = http.createServer(async (req, res) => {
 
     // Marketplace channel: requests relayed by a monetized API marketplace
     // (e.g. RapidAPI) are already billed by that marketplace, so they skip the
+    // x402 handshake entirely. The marketplace proves itself with a shared
     // proxy secret HEADER only.
     // SECURITY (2026-10-08): no hardcoded fallback — if MARKETPLACE_PROXY_SECRET
-    // is not set in the environment, this channel is fully disabled. The secret
-    // is accepted from the x-rapidapi-proxy-secret / x-rapidapi-key request
-    // headers exclusively; query-string and JSON-body channels were removed
-    // (payment-gate bypass reported and fixed 2026-10-08, the previously
-    // committed literal is burned and must never be reused).
-    const proxySecret = process.env.MARKETPLACE_PROXY_SECRET || null;
+    // is unset the channel is fully closed. Secret is never accepted from the
+    // query string or body (those leak into logs, Referer headers and caches).
+    const proxySecret = gatewaySecret();
     const marketplaceHit =
       req.headers['x-rapidapi-proxy-secret'] ||
       req.headers['x-rapidapi-key'] ||
+      req.headers['x-api-key'] ||
+      req.headers['x-gateway-key'] ||
       null;
-    if (proxySecret && marketplaceHit && marketplaceHit === proxySecret) {
+    if (proxySecret && marketplaceHit && marketplaceHit === proxySecret && gatewayAllow()) {
       try {
         const result = await tool.run(normalizeArgs(toolKey, body));
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -1349,6 +1606,11 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));
 });
+
+// Never let an unexpected async error kill the seller process — a dead seller
+// looks to every buyer like a permanently unpayable resource (fresh 402s).
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('fitze-x402-seller listening on :' + PORT);
