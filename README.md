@@ -36,6 +36,16 @@ Drop that into your client config:
 `initialize` and `tools/list` are free. An unpaid `tools/call` returns HTTP 402 with
 x402 payment requirements; an x402-capable client pays and retries automatically.
 
+## Verified payment (PayAPI Market)
+
+`/tools/domain_intel` has been paid-canaried by PayAPI Market: they sent a real signed
+USDC payment on Base, got HTTP 200 with live data, and the settlement is on chain
+([tx 0x018c7d96…](https://basescan.org/tx/0x018c7d961154f51f8558b37871371233720e6cedaf5716fb57377af4df88e2c7),
+block 52475737, $0.005 to `0x0751C1d8DbA83d8968401293b50Bc91E7701dcf8`).
+
+Listing with the verified badge: https://payapi.market/api/fitze-multi-source-data-tools
+Agents can discover and pay it through the PayAPI MCP endpoint: https://payapi.market/mcp
+
 ## Tools (USDC on Base, per call)
 
 | Tool | Price | What it returns |
