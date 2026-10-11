@@ -1252,15 +1252,17 @@ const server = http.createServer(async (req, res) => {
 
     // Marketplace channel: requests relayed by a monetized API marketplace
     // (e.g. RapidAPI) are already billed by that marketplace, so they skip the
-    // x402 handshake entirely. The marketplace proves itself with a shared
-    // proxy secret header; when it is present and matches, the call is served.
-    const proxySecret =
-      process.env.MARKETPLACE_PROXY_SECRET || 'fe911cad05a9b1a108374ad69ecd5b4b9e95af91dcf39951';
+    // proxy secret HEADER only.
+    // SECURITY (2026-10-08): no hardcoded fallback — if MARKETPLACE_PROXY_SECRET
+    // is not set in the environment, this channel is fully disabled. The secret
+    // is accepted from the x-rapidapi-proxy-secret / x-rapidapi-key request
+    // headers exclusively; query-string and JSON-body channels were removed
+    // (payment-gate bypass reported and fixed 2026-10-08, the previously
+    // committed literal is burned and must never be reused).
+    const proxySecret = process.env.MARKETPLACE_PROXY_SECRET || null;
     const marketplaceHit =
       req.headers['x-rapidapi-proxy-secret'] ||
       req.headers['x-rapidapi-key'] ||
-      url.searchParams.get('x-rapidapi-proxy-secret') ||
-      body['x-rapidapi-proxy-secret'] ||
       null;
     if (proxySecret && marketplaceHit && marketplaceHit === proxySecret) {
       try {
