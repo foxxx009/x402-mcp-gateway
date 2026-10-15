@@ -8,6 +8,35 @@ import { rpc, erc20, decodeErc20String, decodeUint } from './eth.js';
 export const tools = {};
 
 // ---------------------------------------------------------------------------
+// RDAP bootstrap: rdap.org 302-redirects to the registry and some targets
+// answer 403 to that path. Resolve the TLD's authoritative RDAP base from
+// IANA's bootstrap file (cached in-process) and hit it directly; rdap.org is
+// only the fallback.
+const rdapBootstrap = { at: 0, map: null };
+async function rdapBaseFor(tld) {
+  if (!rdapBootstrap.map || Date.now() - rdapBootstrap.at > 3600e3) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch('https://data.iana.org/rdap/dns.json', { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.ok) {
+        const j = await r.json();
+        const m = new Map();
+        for (const [tlds, bases] of j.services || []) {
+          for (const t of tlds) if (!m.has(t)) m.set(t, bases[0]);
+        }
+        rdapBootstrap.map = m;
+        rdapBootstrap.at = Date.now();
+      }
+    } catch {
+      /* keep previous cache or null */
+    }
+  }
+  return rdapBootstrap.map ? rdapBootstrap.map.get(tld) : null;
+}
+
+// ---------------------------------------------------------------------------
 tools['web_fetch'] = {
   priceUsd: 0.005,
   description:
@@ -57,7 +86,7 @@ tools['web_fetch'] = {
 
 // ---------------------------------------------------------------------------
 tools['domain_intel'] = {
-  priceUsd: 0.01,
+  priceUsd: 0.005,
   description:
     'Domain due-diligence bundle: RDAP registrar + creation/expiry dates + ' +
     'status, DNS records (A/MX/NS/TXT), and Certificate Transparency history ' +
@@ -66,27 +95,42 @@ tools['domain_intel'] = {
     if (!domain) throw new Error('domain required');
     domain = String(domain).trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     const out = { domain };
-    try {
-      const r = await fetch('https://rdap.org/domain/' + encodeURIComponent(domain));
-      if (r.ok) {
-        const j = await r.json();
-        const reg = (j.entities || []).find((e) => (e.roles || []).includes('registrar'));
-        out.rdap = {
-          registrar:
-            (reg &&
-              reg.vcardArray &&
-              reg.vcardArray[1] &&
-              (reg.vcardArray[1].find((v) => v[0] === 'fn') || [])[3]) ||
-            reg?.handle ||
-            null,
-          created: (j.events || []).find((e) => e.eventAction === 'registration')?.eventDate || null,
-          expires: (j.events || []).find((e) => e.eventAction === 'expiration')?.eventDate || null,
-          status: j.status || null,
-        };
-      } else out.rdap = { error: 'rdap ' + r.status };
-    } catch (e) {
-      out.rdap = { error: String(e) };
+    const tld = domain.split('.').pop();
+    const base = await rdapBaseFor(tld);
+    const rdapUrls = [];
+    if (base) rdapUrls.push(base.replace(/\/+$/, '') + '/domain/' + encodeURIComponent(domain));
+    rdapUrls.push('https://rdap.org/domain/' + encodeURIComponent(domain));
+    let rdapErr = null;
+    for (const u of rdapUrls) {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 8000);
+        const r = await fetch(u, { signal: ctrl.signal });
+        clearTimeout(t);
+        if (r.ok) {
+          const j = await r.json();
+          const reg = (j.entities || []).find((e) => (e.roles || []).includes('registrar'));
+          out.rdap = {
+            registrar:
+              (reg &&
+                reg.vcardArray &&
+                reg.vcardArray[1] &&
+                (reg.vcardArray[1].find((v) => v[0] === 'fn') || [])[3]) ||
+              reg?.handle ||
+              null,
+            created: (j.events || []).find((e) => e.eventAction === 'registration')?.eventDate || null,
+            expires: (j.events || []).find((e) => e.eventAction === 'expiration')?.eventDate || null,
+            status: j.status || null,
+          };
+          rdapErr = null;
+          break;
+        }
+        rdapErr = 'rdap ' + r.status + ' (' + new URL(u).host + ')';
+      } catch (e) {
+        rdapErr = String(e);
+      }
     }
+    if (rdapErr) out.rdap = { error: rdapErr };
     const recs = {};
     for (const type of ['A', 'MX', 'NS', 'TXT']) {
       try {
@@ -115,7 +159,7 @@ tools['domain_intel'] = {
 
 // ---------------------------------------------------------------------------
 tools['github_repo'] = {
-  priceUsd: 0.01,
+  priceUsd: 0.005,
   description:
     'GitHub repo snapshot: stars, forks, open-issue count, watchers, primary ' +
     'language, SPDX license, created/pushed dates and latest release tag. ' +
@@ -152,7 +196,7 @@ tools['github_repo'] = {
 
 // ---------------------------------------------------------------------------
 tools['token_intel'] = {
-  priceUsd: 0.01,
+  priceUsd: 0.005,
   description:
     'Base ERC-20 due-diligence: on-chain name, symbol, decimals and total ' +
     'supply via eth_call. Use to sanity-check a Base token address before ' +
@@ -187,7 +231,7 @@ function parseLinkLastCount(linkHeader) {
 }
 
 tools['repo_diligence'] = {
-  priceUsd: 0.25,
+  priceUsd: 0.03,
   description:
     'Deep GitHub repo due-diligence: base snapshot + last 5 commits (author/date/' +
     'message), contributor count, archived flag, security-policy presence, latest ' +
@@ -235,7 +279,7 @@ tools['repo_diligence'] = {
 };
 
 tools['web_brief'] = {
-  priceUsd: 0.05,
+  priceUsd: 0.02,
   description:
     'Multi-source research brief from 1–3 URLs. For each source extract title, ' +
     'meta description, key sentences (numbered/quoted/date-or-figure-bearing) and ' +
@@ -476,7 +520,7 @@ const UA = { 'user-agent': 'x402-opendata/1.0 (+https://fitze-fitze-x402-seller.
 
 // ---------------------------------------------------------------------------
 tools['usgs_earthquakes'] = {
-  priceUsd: 0.005,
+  priceUsd: 0.002,
   description:
     'Recent earthquakes from the USGS GeoJSON feed (no API key). Returns ' +
     'magnitude, place, time, depth and coordinates for each event. ' +
@@ -513,7 +557,7 @@ tools['usgs_earthquakes'] = {
 
 // ---------------------------------------------------------------------------
 tools['open_meteo_weather'] = {
-  priceUsd: 0.005,
+  priceUsd: 0.002,
   description:
     'Current weather from Open-Meteo (no API key, no signup). Given lat/lon ' +
     'returns temperature (C), apparent temperature, humidity, wind speed, ' +
@@ -541,7 +585,7 @@ tools['open_meteo_weather'] = {
 
 // ---------------------------------------------------------------------------
 tools['exchange_rates'] = {
-  priceUsd: 0.005,
+  priceUsd: 0.002,
   description:
     'Live fiat exchange rates (open.er-api.com, no key, ~200 currencies). ' +
     'Params: base = ISO code (default USD); to = comma list or single code ' +
@@ -567,7 +611,7 @@ tools['exchange_rates'] = {
 
 // ---------------------------------------------------------------------------
 tools['sec_edgar_search'] = {
-  priceUsd: 0.05,
+  priceUsd: 0.02,
   description:
     'SEC EDGAR full-text search (efts.sec.gov, no key). Find filings by term. ' +
     'Params: q = search term (required); forms = comma list e.g. 10-K,8-K; ' +
@@ -598,7 +642,7 @@ tools['sec_edgar_search'] = {
 
 // ---------------------------------------------------------------------------
 tools['fda_recalls'] = {
-  priceUsd: 0.05,
+  priceUsd: 0.02,
   description:
     'FDA recall enforcement reports from open.fda.gov (no key, rate-limited). ' +
     'Params: type = food|drug|device (default food); reason = free-text filter; ' +
