@@ -37,6 +37,39 @@ async function rdapBaseFor(tld) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared page fetch with ONE retry. A paid call that dies on a transient
+// egress blip (DNS hiccup, connection reset, slow TLS) reads to the buyer as
+// "took the money, returned nothing": PayAPI's 2026-10-15 web_fetch canary
+// settled $0.005 and then hit exactly such a blip ({"error":"fetch failed"}).
+// HTTP error statuses are NOT retried — a 404/403 page is a valid result.
+async function fetchPage(url, timeoutMs = 20000) {
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, {
+        signal: ctrl.signal,
+        redirect: 'follow',
+        headers: { 'user-agent': 'x402-seller/1.0', accept: 'text/html,application/json,*/*' },
+      });
+      const raw = await r.text();
+      return { status: r.status, finalUrl: r.url, contentType: r.headers.get('content-type'), raw };
+    } catch (e) {
+      lastErr = e;
+      if (attempt === 0) await new Promise((res) => setTimeout(res, 1500));
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  const cause =
+    lastErr && lastErr.cause ? String(lastErr.cause.message || lastErr.cause.code || lastErr.cause) : '';
+  throw new Error(
+    `fetch failed for ${url}${cause ? ` (${cause})` : ''} — target unreachable from this server ` +
+      `(DNS/connection/timeout); payment was settled, retry later or try another host`
+  );
+}
+
 tools['web_fetch'] = {
   priceUsd: 0.005,
   description:
@@ -48,39 +81,29 @@ tools['web_fetch'] = {
     // Accept a bare host too: the hosting gateway's WAF blocks query strings
     // that contain "://", so callers pass example.com rather than https://...
     if (!/^https?:\/\//.test(url)) url = 'https://' + String(url).trim();
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 15000);
-    try {
-      const r = await fetch(url, {
-        signal: ctrl.signal,
-        redirect: 'follow',
-        headers: { 'user-agent': 'x402-seller/1.0', accept: 'text/html,application/json,*/*' },
-      });
-      const raw = await r.text();
-      const m = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-      const title = m ? m[1].replace(/\s+/g, ' ').trim() : '';
-      const clean = raw
-        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, Number(maxChars) || 4000);
-      const links = [...raw.matchAll(/href=["']([^"']+)["']/gi)]
-        .map((x) => x[1])
-        .filter((l) => /^https?:\/\//.test(l))
-        .slice(0, 20);
-      return {
-        status: r.status,
-        finalUrl: r.url,
-        contentType: r.headers.get('content-type'),
-        title,
-        text: clean,
-        links,
-      };
-    } finally {
-      clearTimeout(t);
-    }
+    const page = await fetchPage(url);
+    const raw = page.raw;
+    const m = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = m ? m[1].replace(/\s+/g, ' ').trim() : '';
+    const clean = raw
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, Number(maxChars) || 4000);
+    const links = [...raw.matchAll(/href=["']([^"']+)["']/gi)]
+      .map((x) => x[1])
+      .filter((l) => /^https?:\/\//.test(l))
+      .slice(0, 20);
+    return {
+      status: page.status,
+      finalUrl: page.finalUrl,
+      contentType: page.contentType,
+      title,
+      text: clean,
+      links,
+    };
   },
 };
 
@@ -292,15 +315,9 @@ tools['web_brief'] = {
     if (!list.length) throw new Error('at least one valid http(s) url required');
     const out = [];
     for (const url of list) {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 15000);
       try {
-        const r = await fetch(url, {
-          signal: ctrl.signal,
-          redirect: 'follow',
-          headers: { 'user-agent': 'x402-seller/1.0', accept: 'text/html,application/json,*/*' },
-        });
-        const raw = await r.text();
+        const page = await fetchPage(url);
+        const raw = page.raw;
         const titleM = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
         const title = titleM ? titleM[1].replace(/\s+/g, ' ').trim() : '';
         const metaM = raw.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
@@ -319,11 +336,9 @@ tools['web_brief'] = {
           .map((x) => x[1])
           .filter((l) => /^https?:\/\//.test(l))
           .slice(0, 15);
-        out.push({ url: r.url, status: r.status, title, meta, keySentences: sentences, links });
+        out.push({ url: page.finalUrl, status: page.status, title, meta, keySentences: sentences, links });
       } catch (e) {
-        out.push({ url, error: String(e).split('\n')[0] });
-      } finally {
-        clearTimeout(t);
+        out.push({ url, error: String(e.message || e).split('\n')[0] });
       }
     }
     return { sources: out.length, brief: out };
@@ -492,26 +507,14 @@ tools['free_url_check'] = {
     // Accept a bare host too: the hosting gateway's WAF blocks query strings
     // that contain "://", so callers pass example.com rather than https://...
     if (!/^https?:\/\//.test(url)) url = 'https://' + String(url).trim();
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    try {
-      const r = await fetch(url, {
-        method: 'GET',
-        signal: ctrl.signal,
-        redirect: 'follow',
-        headers: { 'user-agent': 'x402-seller/1.0', accept: 'text/html,application/json,*/*' },
-      });
-      const raw = (await r.text()).slice(0, 4096);
-      const m = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-      return {
-        status: r.status,
-        finalUrl: r.url,
-        contentType: r.headers.get('content-type'),
-        title: m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '',
-      };
-    } finally {
-      clearTimeout(t);
-    }
+    const page = await fetchPage(url, 10000);
+    const m = page.raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return {
+      status: page.status,
+      finalUrl: page.finalUrl,
+      contentType: page.contentType,
+      title: m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '',
+    };
   },
 };
 
